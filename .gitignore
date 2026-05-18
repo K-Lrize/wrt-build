@@ -1,0 +1,13 @@
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+*.log
+*.tmp
+out/
+repo/
+repo-keys/
+*.bin
+*.apk
+*.tar.zst
