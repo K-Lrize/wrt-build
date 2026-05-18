@@ -1,0 +1,29 @@
+name: Lint and format check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint and format check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 安装校验与排版工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shfmt jq
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: 校验 YAML / JSON / Markdown 排版格式
+        run: npx -y prettier@latest --check "**/*.{yml,yaml,json,md}"
+
+      - name: 校验 Shell 脚本排版格式
+        run: find scripts -name "*.sh" -exec shfmt -d -i 4 -s {} +
