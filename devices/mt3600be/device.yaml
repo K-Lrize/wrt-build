@@ -1,0 +1,158 @@
+# GL.iNet GL-MT3600BE（MT7987a + MT7990 Wi-Fi 7）
+
+name: mt3600be
+
+target: mediatek
+subtarget: filogic
+profile: glinet_gl-mt3600be
+arch: aarch64_cortex-a53
+
+source:
+  channel: openwrt-25.12
+  mode: download
+  upstream: https://downloads.openwrt.org/releases/25.12.5
+
+packages:
+  add:
+    # LuCI
+    - luci
+    - luci-base
+    - luci-ssl
+    - luci-mod-admin-full
+    - luci-app-firewall
+    - luci-app-uhttpd
+    - luci-theme-bootstrap
+    - luci-i18n-base-zh-cn
+    - luci-i18n-firewall-zh-cn
+    - luci-i18n-sqm-zh-cn
+    - luci-i18n-acme-zh-cn
+    - luci-i18n-ddns-zh-cn
+    - luci-i18n-banip-zh-cn
+    - luci-i18n-nlbwmon-zh-cn
+    - luci-i18n-upnp-zh-cn
+    - luci-i18n-watchcat-zh-cn
+    - luci-i18n-wifischedule-zh-cn
+    - luci-i18n-wol-zh-cn
+    - luci-i18n-package-manager-zh-cn
+    - luci-i18n-uhttpd-zh-cn
+    - luci-i18n-smartdns-zh-cn
+
+    # 网络
+    - ip-full
+    - nftables-json
+    - ca-bundle
+    - dnsmasq-full
+    - odhcp6c
+    - odhcpd-ipv6only
+    - wireguard-tools
+    - luci-proto-wireguard
+
+    - kmod-nft-tproxy
+    - kmod-nft-socket
+    - kmod-nft-nat
+    - kmod-nft-fib
+    - kmod-nf-conntrack
+    - kmod-nf-nat
+    - kmod-nf-flow
+    - kmod-tun
+    - kmod-ip6tables
+    - kmod-nf-reject6
+    - kmod-ip6-tunnel
+    - kmod-tcp-bbr
+    - kmod-sched
+    - kmod-sched-core
+    - kmod-sched-cake
+    - kmod-ifb
+    - kmod-usb-core
+    - kmod-usb3
+    - kmod-usb-storage
+    # USB
+    - kmod-usb-net
+    - kmod-usb-net-rndis
+    - kmod-usb-net-cdc-ncm
+    - kmod-usb-net-cdc-ether
+    - kmod-usb-net-ipheth
+    - kmod-usb-net-qmi-wwan
+    - kmod-usb-net-cdc-mbim
+    - kmod-usb-serial-option
+    # PPPoE
+    - kmod-ppp
+    - kmod-pppoe
+    - kmod-pppox
+    - ppp
+    - ppp-mod-pppoe
+    - kmod-nls-utf8
+    - kmod-fs-ext4
+    - block-mount
+    - e2fsprogs
+
+    - wpad-openssl
+
+    - modemmanager
+    - luci-proto-modemmanager
+    - usb-modeswitch
+    - libqmi
+    - libmbim
+    - libimobiledevice
+    - usbutils
+
+    # DNS / 防火墙 / QoS
+    - smartdns
+    - luci-app-smartdns
+    - banip
+    - luci-app-banip
+    - sqm-scripts
+    - luci-app-sqm
+    - irqbalance
+    - conntrack
+
+    - acme-common
+    - acme-acmesh
+    - acme-acmesh-dnsapi
+    - luci-app-acme
+    - watchcat
+    - luci-app-watchcat
+    - ddns-scripts
+    - luci-app-ddns
+    - wifischedule
+    - luci-app-wifischedule
+    - luci-app-wol
+    - etherwake
+    - luci-app-upnp
+    - logrotate
+
+    - nlbwmon
+    - luci-app-nlbwmon
+    - prometheus-node-exporter-lua
+
+    - zsh
+    - vim-full
+    - tmux
+    - ncdu
+    - lsof
+    - socat
+    - drill
+    - git
+    - git-http
+    - openssh-sftp-server
+    - zram-swap
+    # - eza
+    - ripgrep
+
+    # sing-box
+    - sing-box
+
+  remove:
+    # dnsmasq-full, 需显式排除
+    - dnsmasq
+    # wpad-openssl, wpad 变体排除
+    - wpad-basic
+    - wpad-basic-mbedtls
+    - wpad-basic-wolfssl
+    - wpad-mbedtls
+    - wpad-wolfssl
+
+repos: []
+
+image:
+  rootfs_partsize: 256

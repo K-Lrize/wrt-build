@@ -1,0 +1,12 @@
+# 所有设备共享的基础包。
+
+packages:
+  add:
+    - curl
+    - wget-ssl
+    - rsync
+    - jq
+    - tcpdump
+    - iperf3
+    - htop
+  remove: []
