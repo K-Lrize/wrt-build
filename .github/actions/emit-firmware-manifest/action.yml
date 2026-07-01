@@ -1,0 +1,103 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+
+name: Emit Firmware Manifest & Sign
+description: 生成固件哈希校验清单 (sha256sums)、私钥签名及元数据描述 (manifest.json)
+
+inputs:
+  out_dir:
+    description: "固件构建输出目录"
+    required: true
+  private_key_path:
+    description: "签名私钥 PEM 文件安全路径"
+    required: false
+    default: ""
+  repositories_file:
+    description: "IB repositories 文件路径，用于提取 vermagic"
+    required: false
+    default: ""
+  channel:
+    description: "发布通道 (例如 openwrt-25.12)"
+    required: true
+  mode:
+    description: "来源模式 (download / build)"
+    required: true
+  device:
+    description: "目标设备名称"
+    required: true
+  target:
+    description: "架构 target/subtarget"
+    required: true
+  profile:
+    description: "设备 profile"
+    required: true
+  arch:
+    description: "设备 arch"
+    required: true
+  snapshot_id:
+    description: "快照 ID"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: 生成哈希与安全签名
+      shell: bash
+      run: |
+        set -euo pipefail
+        DIR="${GITHUB_WORKSPACE}/${{ inputs.out_dir }}"
+        cd "${DIR}"
+
+        find . -maxdepth 1 -type f ! -name 'manifest.json' ! -name 'sha256sums*' -exec sha256sum {} + > sha256sums 2>/dev/null || true
+
+        if [[ ! -s sha256sums ]]; then
+          echo "::error::固件构建完成，但未生成任何有效的固件镜像文件！终止发布。"
+          exit 1
+        fi
+
+        PRIV="${{ inputs.private_key_path }}"
+        if [[ -n "${PRIV}" && -f "${PRIV}" ]]; then
+          echo "正在签署 sha256sums..."
+          openssl dgst -sha256 -sign "${PRIV}" sha256sums | base64 -w 0 > sha256sums.sig
+        else
+          echo "::warning::未找到签名私钥文件，跳过 sha256sums 签名操作。"
+        fi
+
+    - name: 构造元数据清单
+      shell: bash
+      run: |
+        set -euo pipefail
+        DIR="${GITHUB_WORKSPACE}/${{ inputs.out_dir }}"
+        REPO_FILE="${GITHUB_WORKSPACE}/${{ inputs.repositories_file }}"
+
+        VM_SEG=""
+        if [[ -f "${REPO_FILE}" ]]; then
+          VM_SEG="$(grep -oE '/kmods/[^/]+/' "${REPO_FILE}" | head -1 | sed 's|/kmods/||;s|/||' || echo "")"
+        fi
+        echo "提取固件 vermagic_segment: ${VM_SEG:-未提取}"
+
+        jq -n \
+          --arg channel          '${{ inputs.channel }}' \
+          --arg mode             '${{ inputs.mode }}' \
+          --arg commit           "${GITHUB_SHA:0:7}" \
+          --arg time             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg device           '${{ inputs.device }}' \
+          --arg target           '${{ inputs.target }}' \
+          --arg profile          '${{ inputs.profile }}' \
+          --arg arch             '${{ inputs.arch }}' \
+          --arg snapshot         '${{ inputs.snapshot_id }}' \
+          --arg vermagic         "${VM_SEG}" \
+          --arg run_url          "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+          '{
+            channel: $channel,
+            mode: $mode,
+            build_commit: $commit,
+            build_time: $time,
+            device: $device,
+            target: $target,
+            profile: $profile,
+            arch: $arch,
+            snapshot_id: $snapshot,
+            type: "firmware",
+            vermagic_segment: $vermagic,
+            ci_run_url: $run_url
+          }' > "${DIR}/manifest.json"

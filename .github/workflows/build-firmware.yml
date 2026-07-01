@@ -1,0 +1,297 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Build device firmware
+
+on:
+  workflow_run:
+    workflows:
+      - Build user packages
+    types: [completed]
+    branches: [main]
+  push:
+    paths:
+      - "devices/**"
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "仅构建指定设备（留空构建全部）"
+        required: false
+        default: ""
+
+jobs:
+  list-devices:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      devices: ${{ steps.list.outputs.devices }}
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 安装解析依赖
+        uses: ./.github/actions/setup-build-env
+        with:
+          profile: minimal
+
+      - name: 静态校验设备配置
+        run: bash scripts/lint-devices.sh
+
+      - name: 解析构建设备矩阵
+        id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 防并发冲突：如果当前 push 同时触发了正在运行的包编译，主动让路
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            PKG_BUSY="$(gh run list --workflow="build-packages.yml" --commit="${GITHUB_SHA}" --json status --jq 'map(select(.status == "in_progress" or .status == "queued")) | length' 2>/dev/null || echo 0)"
+            if (( PKG_BUSY > 0 )); then
+              echo "::notice::检测到当前 commit 正在进行软件包构建，跳过本次 push 固件构建，等待 packages 完成后终局触发。"
+              echo "devices=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if [[ -n "${{ inputs.device }}" ]]; then
+            DEVS="$(printf '%s' '${{ inputs.device }}' | tr ',' '\n' | sed '/^[[:space:]]*$/d' | jq -R . | jq -sc .)"
+          else
+            DEVS="$(for dy in devices/*/device.yaml; do
+              [[ -f "${dy}" ]] || continue
+              dev="$(basename "$(dirname "${dy}")")"
+              [[ "${dev}" == "_common" ]] && continue
+              # push 事件下跳过 mode:build 设备，由 build-toolchain 完成后再触发
+              if [[ "${{ github.event_name }}" == "push" ]]; then
+                mode="$(yq '.source.mode // ""' "${dy}")"
+                [[ "${mode}" == "build" ]] && continue
+              fi
+              echo "${dev}"
+            done | jq -R . | jq -sc .)"
+          fi
+          echo "devices=${DEVS}" >> "$GITHUB_OUTPUT"
+          echo "构建设备矩阵: ${DEVS}"
+
+  build-firmware:
+    name: Build Firmware (${{ matrix.device }})
+    needs: list-devices
+    if: needs.list-devices.outputs.devices != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    concurrency:
+      group: publish-firmware-${{ matrix.device }}
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      matrix:
+        device: ${{ fromJson(needs.list-devices.outputs.devices) }}
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 安装基础环境依赖
+        uses: ./.github/actions/setup-build-env
+        with:
+          profile: minimal
+
+      - name: 解析设备配置
+        id: dev
+        run: |
+          eval "$(bash scripts/resolve-device.sh '${{ matrix.device }}' export)"
+          {
+            echo "target=${TARGET}"
+            echo "subtarget=${SUBTARGET}"
+            echo "profile=${PROFILE}"
+            echo "arch=${ARCH}"
+            echo "channel=${SOURCE_CHANNEL}"
+            echo "mode=${SOURCE_MODE}"
+            echo "kmod_source=${SOURCE_KMOD_SOURCE}"
+            echo "major=${OPENWRT_MAJOR}"
+            echo "source_upstream=${SOURCE_UPSTREAM}"
+            echo "rootfs_partsize=${IMAGE_ROOTFS_PARTSIZE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 计算快照 ID
+        id: snap
+        run: echo "id=r$(date -u +%Y.%m.%d-%H%M)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: 下载并解压 ImageBuilder
+        uses: ./.github/actions/setup-openwrt-archive
+        with:
+          archive_type: imagebuilder
+          channel: ${{ steps.dev.outputs.major }}
+          mode: ${{ steps.dev.outputs.mode }}
+          target: ${{ steps.dev.outputs.target }}/${{ steps.dev.outputs.subtarget }}
+          downloads: ${{ steps.dev.outputs.source_upstream }}
+          r2_public_url: ${{ vars.R2_PUBLIC_URL }}
+          out_dir: ib
+
+      - name: 配置 R2 远端 (预拉取自有源)
+        uses: ./.github/actions/setup-rclone
+        with:
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 预同步 R2 上的自有包与最新索引
+        run: |
+          # 同步至独立目录 ib/custom，避免覆盖 IB 自带本地源
+          mkdir -p ib/custom
+          rclone copy "r2:${{ vars.R2_BUCKET }}/${{ steps.dev.outputs.channel }}/packages/${{ steps.dev.outputs.arch }}" ib/custom \
+            --progress --transfers 8 --checkers 16 || true
+          rm -f ~/.config/rclone/rclone.conf
+
+      - name: 生成 repositories 文件
+        run: |
+          if [[ -f ib/repositories ]]; then
+            cp ib/repositories ib/repositories.orig
+          elif [[ -f ib/repositories.conf ]]; then
+            cp ib/repositories.conf ib/repositories.orig
+          else
+            touch ib/repositories.orig
+          fi
+
+          # kmod_source=build：从 R2 上的工具链指针文件自动读取 vermagic，确保 kmod URL 含正确的内核标识子目录
+          # kmod_source=download：使用官方预编译 kmod，不需要 vermagic 路径管理
+          EXTRA_ARGS=()
+          if [[ "${{ steps.dev.outputs.kmod_source }}" == "build" ]]; then
+            echo "获取最新工具链 vermagic..."
+            TC_JSON="$(curl -fsSL --connect-timeout 15 \
+              "${{ vars.R2_PUBLIC_URL }}/${{ steps.dev.outputs.major }}/targets/${{ steps.dev.outputs.target }}/${{ steps.dev.outputs.subtarget }}/latest-toolchain.json")"
+            VM_SEG="$(echo "${TC_JSON}" | jq -r '.vermagic_segment // ""')"
+            [[ -n "${VM_SEG}" ]] || { echo "::error::latest-toolchain.json 中未找到 vermagic_segment"; exit 1; }
+            EXTRA_ARGS+=(--kmod-vermagic "${VM_SEG}")
+          fi
+
+          bash scripts/gen-repositories.sh \
+            --device "${{ matrix.device }}" \
+            --output ib/repositories \
+            --runtime-output ib/files-overlay/etc/apk/repositories.d/99-custom.list \
+            --repo-base "${{ vars.R2_PUBLIC_URL }}" \
+            --original ib/repositories.orig \
+            "${EXTRA_ARGS[@]}"
+
+          cp ib/repositories ib/repositories.conf
+
+          echo "::group::repositories 文件内容"
+          cat ib/repositories
+          echo "::endgroup::"
+
+          echo "验证远程软件源可达性..."
+          while IFS= read -r url; do
+            [[ "${url}" == http* ]] || continue
+            if ! curl --output /dev/null --silent --head --fail --connect-timeout 5 "$url"; then
+              echo "::error::软件源不可达 [HTTP 错误]: $url"
+              exit 1
+            fi
+          done < ib/repositories
+          echo "软件源连接校验通过。"
+
+      - name: 准备 files 目录
+        run: bash scripts/resolve-device.sh '${{ matrix.device }}' files ib/files-overlay
+
+      - name: 执行 image scripts
+        run: bash scripts/run-image-scripts.sh '${{ matrix.device }}' ib/files-overlay
+
+      - name: 准备签名密钥
+        id: keys
+        uses: ./.github/actions/setup-apk-keys
+        with:
+          private_key: ${{ secrets.APK_PRIVATE_KEY }}
+          public_key: ${{ secrets.APK_PUBLIC_KEY }}
+
+      - name: 注入公钥到 IB host + 设备 rootfs
+        # 注入宿主用于打包阶段验证自有源，注入 rootfs 用于设备运行期验证包索引
+        run: |
+          OVERLAY=ib/files-overlay
+          mkdir -p ib/keys "${OVERLAY}/etc/apk/keys"
+          cp "${{ steps.keys.outputs.public_key_path }}" "ib/keys/${{ steps.keys.outputs.fingerprint }}.pem"
+          cp "${{ steps.keys.outputs.public_key_path }}" "${OVERLAY}/etc/apk/keys/${{ steps.keys.outputs.fingerprint }}.pem"
+
+      - name: 构建固件
+        working-directory: ib
+        run: |
+          eval "$(bash "${GITHUB_WORKSPACE}/scripts/resolve-device.sh" '${{ matrix.device }}' packages)"
+
+          # IB 为 thin 模式，make image 用完整 repositories.conf 在线取包
+          MAKE_ARGS=(
+            PROFILE="${{ steps.dev.outputs.profile }}"
+            PACKAGES="${PACKAGES}"
+            ADD_LOCAL_KEY=1
+            CONFIG_IB_STANDALONE=
+            BIN_DIR="${PWD}/out"
+            FILES="files-overlay"
+          )
+
+          ROOTFS_SIZE="${{ steps.dev.outputs.rootfs_partsize }}"
+          if (( ROOTFS_SIZE > 0 )); then
+            MAKE_ARGS+=(ROOTFS_PARTSIZE="${ROOTFS_SIZE}")
+          fi
+
+          make image "${MAKE_ARGS[@]}" V=s
+
+      - name: 生成 sha256sums 与 manifest
+        uses: ./.github/actions/emit-firmware-manifest
+        with:
+          out_dir: ib/out
+          private_key_path: ${{ steps.keys.outputs.private_key_path }}
+          repositories_file: ib/repositories
+          channel: ${{ steps.dev.outputs.major }}
+          mode: ${{ steps.dev.outputs.mode }}
+          device: ${{ matrix.device }}
+          target: ${{ steps.dev.outputs.target }}/${{ steps.dev.outputs.subtarget }}
+          profile: ${{ steps.dev.outputs.profile }}
+          arch: ${{ steps.dev.outputs.arch }}
+          snapshot_id: ${{ steps.snap.outputs.id }}
+
+      - name: 发布固件到 R2
+        uses: ./.github/actions/publish-r2
+        with:
+          src: ib/out
+          dst: ${{ steps.dev.outputs.major }}/targets/${{ steps.dev.outputs.target }}/${{ steps.dev.outputs.subtarget }}/firmware/${{ matrix.device }}/${{ steps.snap.outputs.id }}
+          mode: latest
+          bucket: ${{ vars.R2_BUCKET }}
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 生成 Action 总结报告
+        if: always()
+        run: |
+          VM_SEG="$(jq -r '.vermagic_segment // ""' ib/out/manifest.json 2>/dev/null || echo "")"
+          source scripts/lib/common.sh
+          emit_summary_table "固件定制构建报告" \
+            "目标设备" "\`${{ matrix.device }}\`" \
+            "架构平台" "\`${{ steps.dev.outputs.target }}/${{ steps.dev.outputs.subtarget }}\`" \
+            "内核标识 (vermagic)" "\`${VM_SEG:-未提取}\`" \
+            "发布通道" "\`${{ steps.dev.outputs.major }}\`" \
+            "分发路径" "\`${{ steps.dev.outputs.major }}/targets/${{ steps.dev.outputs.target }}/${{ steps.dev.outputs.subtarget }}/firmware/${{ matrix.device }}/\`"
+
+          shopt -s nullglob
+          files=( ib/out/* )
+          has_img=false
+          for f in "${files[@]}"; do
+            if [[ -f "$f" && "$f" != *"manifest.json"* && "$f" != *"sha256sums"* ]]; then
+              has_img=true
+              break
+            fi
+          done
+
+          if [ "$has_img" = true ]; then
+            {
+              echo "#### 固件镜像清单"
+              echo ""
+              echo "| 文件名 | 大小 | SHA256 摘要 (前16位) |"
+              echo "| :--- | :--- | :--- |"
+              for f in "${files[@]}"; do
+                if [[ -f "$f" && "$f" != *"manifest.json"* && "$f" != *"sha256sums"* ]]; then
+                  name="$(basename "$f")"
+                  size="$(ls -lh "$f" | awk '{print $5}')"
+                  sha="$(sha256sum "$f" | awk '{print $1}' | cut -c1-16)..."
+                  echo "| \`${name}\` | ${size} | \`${sha}\` |"
+                fi
+              done
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
