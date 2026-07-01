@@ -1,0 +1,77 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+
+name: Publish to Cloudflare R2
+description: 通过 rclone 上传到 R2。
+
+inputs:
+  src:
+    description: 本地源目录
+    required: true
+  dst:
+    description: R2 桶内目标子路径
+    required: true
+  mode:
+    description: sync | copy | latest
+    required: false
+    default: sync
+  bucket:
+    required: true
+  account_id:
+    required: true
+  access_key_id:
+    required: true
+  secret_access_key:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: 配置 R2 远端
+      uses: ./.github/actions/setup-rclone
+      with:
+        account_id: ${{ inputs.account_id }}
+        access_key_id: ${{ inputs.access_key_id }}
+        secret_access_key: ${{ inputs.secret_access_key }}
+
+    - name: 同步到 R2
+      shell: bash
+      run: |
+        set -euo pipefail
+        SRC="${{ inputs.src }}"
+        DST="r2:${{ inputs.bucket }}/${{ inputs.dst }}"
+        MODE="${{ inputs.mode }}"
+        [[ -d "${SRC}" ]] || { echo "::error::待发布源目录不存在: ${SRC}"; exit 1; }
+
+        echo "${SRC} → ${DST} (${MODE})"
+        case "${MODE}" in
+          sync)
+            rclone sync "${SRC}" "${DST}" \
+              --progress --stats-one-line --stats=10s --transfers 8 --checkers 16 ;;
+          copy|latest)
+            rclone copy "${SRC}" "${DST}" \
+              --progress --stats-one-line --stats=10s --transfers 8 --checkers 16 ;;
+          *)
+            echo "::error::不支持的发布模式 (mode): ${MODE}"; exit 1 ;;
+        esac
+
+    - name: 更新 latest.json
+      if: inputs.mode == 'latest'
+      shell: bash
+      run: |
+        set -euo pipefail
+        DST="${{ inputs.dst }}"
+        SNAPSHOT_ID="$(basename "${DST}")"
+        PARENT="$(dirname "${DST}")"
+
+        jq -n \
+          --arg id "${SNAPSHOT_ID}" \
+          --arg path "${SNAPSHOT_ID}/" \
+          --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg sha "${GITHUB_SHA:0:7}" \
+          '{snapshot_id: $id, path: $path, build_time: $time, build_commit: $sha}' \
+          | rclone rcat "r2:${{ inputs.bucket }}/${PARENT}/latest.json"
+
+    - name: 清理 rclone 临时凭证
+      if: always()
+      shell: bash
+      run: rm -f ~/.config/rclone/rclone.conf

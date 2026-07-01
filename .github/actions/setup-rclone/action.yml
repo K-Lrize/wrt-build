@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+
+name: Setup Cloudflare R2 rclone
+description: 安装 rclone 并配置 Cloudflare R2 远端
+
+inputs:
+  account_id:
+    description: Cloudflare Account ID
+    required: true
+  access_key_id:
+    description: R2 Access Key ID
+    required: true
+  secret_access_key:
+    description: R2 Secret Access Key
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: 安装 rclone
+      shell: bash
+      run: |
+        if ! command -v rclone >/dev/null 2>&1; then
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+        fi
+        rclone --version | head -1
+
+    - name: 配置 R2 远端
+      shell: bash
+      env:
+        ACCESS_KEY: ${{ inputs.access_key_id }}
+        SECRET_KEY: ${{ inputs.secret_access_key }}
+        ACCOUNT: ${{ inputs.account_id }}
+      run: |
+        cat > ~/.config/rclone/rclone.conf <<EOF
+        [r2]
+        type = s3
+        provider = Cloudflare
+        access_key_id = ${ACCESS_KEY}
+        secret_access_key = ${SECRET_KEY}
+        endpoint = https://${ACCOUNT}.r2.cloudflarestorage.com
+        acl = private
+        no_check_bucket = true
+        EOF
+        sed -i 's/^[[:space:]]*//' ~/.config/rclone/rclone.conf
+        chmod 600 ~/.config/rclone/rclone.conf
