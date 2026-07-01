@@ -1,0 +1,26 @@
+# armsr/armv8 通用 ARM64 虚拟机（Apple Silicon HVF / KVM 等）
+
+name: vm-armsr
+
+target: armsr
+subtarget: armv8
+profile: generic
+arch: aarch64_generic
+
+source:
+  channel: openwrt-25.12
+  mode: download
+  upstream: https://downloads.openwrt.org/releases/25.12.4
+
+packages:
+  add:
+    - luci
+    - qemu-ga
+    - openssh-server
+    - openssh-keygen
+  remove: []
+
+repos: []
+
+image:
+  rootfs_partsize: 256
