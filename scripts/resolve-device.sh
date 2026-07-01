@@ -39,14 +39,21 @@ SOURCE_REPO="$(yq '.source.repo // ""' "${DEVICE_YAML}")"
 SOURCE_REF="$(yq '.source.ref // ""' "${DEVICE_YAML}")"
 ROOTFS_PARTSIZE="$(yq '.image.rootfs_partsize // 0' "${DEVICE_YAML}")"
 
+SOURCE_KMOD_SOURCE="$(yq '.source.kmod_source // ""' "${DEVICE_YAML}")"
+[[ -z ${SOURCE_KMOD_SOURCE} ]] && SOURCE_KMOD_SOURCE="${SOURCE_MODE}"
+
 [[ -n ${SOURCE_CHANNEL} ]] || log_fatal "${DEVICE}: source.channel 必填"
 [[ -n ${SOURCE_MODE} ]] || log_fatal "${DEVICE}: source.mode 必填"
+if [[ ${SOURCE_KMOD_SOURCE} != "download" && ${SOURCE_KMOD_SOURCE} != "build" ]]; then
+    log_fatal "${DEVICE}: source.kmod_source 必须为 download 或 build"
+fi
 
-if [[ ${SOURCE_MODE} == "download" ]]; then
-    [[ -n ${SOURCE_UPSTREAM} ]] || log_fatal "${DEVICE}: mode=download 时 source.upstream 必填"
-elif [[ ${SOURCE_MODE} == "build" ]]; then
+# source.upstream 为官方上游源根地址，download/build 两种模式均需（L3 社区 feed / 官方直下）
+[[ -n ${SOURCE_UPSTREAM} ]] || log_fatal "${DEVICE}: source.upstream 必填"
+
+if [[ ${SOURCE_MODE} == "build" ]]; then
     [[ -n ${SOURCE_REPO} && -n ${SOURCE_REF} ]] || log_fatal "${DEVICE}: mode=build 时 source.repo/ref 必填"
-else
+elif [[ ${SOURCE_MODE} != "download" ]]; then
     log_fatal "${DEVICE}: source.mode 必须为 download 或 build"
 fi
 OPENWRT_MAJOR="${SOURCE_CHANNEL}"
@@ -94,6 +101,7 @@ export)
     echo "export SOURCE_CHANNEL='${SOURCE_CHANNEL}'"
     echo "export SOURCE_ID='${SOURCE_CHANNEL}'"
     echo "export SOURCE_MODE='${SOURCE_MODE}'"
+    echo "export SOURCE_KMOD_SOURCE='${SOURCE_KMOD_SOURCE}'"
     echo "export SOURCE_UPSTREAM='${SOURCE_UPSTREAM}'"
     echo "export SOURCE_REPO='${SOURCE_REPO}'"
     echo "export SOURCE_REF='${SOURCE_REF}'"

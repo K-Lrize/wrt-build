@@ -36,14 +36,18 @@ source:
   # 获取模式：download（官方直下）或 build（自编译拉取）
   mode: download
 
-  # ── 当 mode: download 时必填 ──
+  # ── 通用必填：官方上游源根地址（UPSTREAM_BASE）──
+  # download 模式：由此直下官方 SDK/IB 与包；build 模式：由此借取 L3 社区 feed。
+  # 脚本会在其后拼接 /targets/<target>/<subtarget>/ 等路径，须严格遵守 OpenWrt 官方目录结构；
+  # 指向 release 时请写完整 patch（如 .../releases/25.12.5），系统不再猜测 patch 号。
   upstream: https://downloads.openwrt.org/snapshots
-  # 脚本会自动在其后拼接 /targets/<target>/<subtarget>/ 路径以定位 SDK/IB
-  # 要求：自定义镜像站必须严格遵守 OpenWrt 官方目录结构
 
   # ── 当 mode: build 时必填 ──
   # repo: https://github.com/openwrt/openwrt
-  # ref: main
+  # ref: main # 分支或 tag 均可（如 v25.12.5）
+
+  # 驱动获取模式解耦（可选）：默认继承 mode 的值
+  # kmod_source: download # 若填 download，即使自编 IB 组装固件也会去官方拉取内核驱动
 ```
 
 ---
