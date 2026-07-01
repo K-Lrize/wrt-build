@@ -1,0 +1,31 @@
+# armsr/armv8 通用 ARM64 虚拟机（自编译 SDK/IB 测试副本）
+
+name: vm-armsr-build
+
+target: armsr
+subtarget: armv8
+profile: generic
+arch: aarch64_generic
+
+source:
+  channel: snapshot
+  mode: build
+  repo: https://github.com/openwrt/openwrt
+  ref: main
+  # 官方上游源根地址：build 模式借此拉取 L3 社区 feed（应匹配 ref 对应的版本线）
+  upstream: https://downloads.openwrt.org/snapshots
+  # 自构建 SDK/IB 强烈建议匹配自编译的内核驱动 (kmod_source: build)，确保 Vermagic 二进制兼容
+  kmod_source: build
+
+packages:
+  add:
+    - luci
+    - qemu-ga
+    - openssh-server
+    - openssh-keygen
+  remove: []
+
+repos: []
+
+image:
+  rootfs_partsize: 256
