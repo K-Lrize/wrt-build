@@ -1,0 +1,194 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Build user packages
+
+on:
+  push:
+    paths:
+      - "packages/**"
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  list-archs:
+    runs-on: ubuntu-24.04
+    outputs:
+      archs: ${{ steps.list.outputs.archs }}
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 安装解析依赖
+        uses: ./.github/actions/setup-build-env
+        with:
+          profile: minimal
+
+      - name: 解析构建架构矩阵
+        id: list
+        run: |
+          ARCHS="$(
+            for dy in devices/*/device.yaml; do
+              [[ -f "${dy}" ]] || continue
+              ARCH="$(yq '.arch' "${dy}")"
+              T="$(yq '.target' "${dy}")"
+              S="$(yq '.subtarget' "${dy}")"
+              CHANNEL="$(yq '.source.channel // ""' "${dy}")"
+              MODE="$(yq '.source.mode // ""' "${dy}")"
+              UPSTREAM="$(yq '.source.upstream // ""' "${dy}")"
+              jq -n --arg n "${ARCH}" --arg t "${T}/${S}" \
+                    --arg channel "${CHANNEL}" --arg mode "${MODE}" --arg up "${UPSTREAM}" \
+                '{"name":$n,"sdk_target":$t,"channel":$channel,"mode":$mode,"upstream":$up}'
+            done | jq -sc 'unique_by([.name, .channel])'
+          )"
+          echo "archs=${ARCHS}" >> "$GITHUB_OUTPUT"
+          echo "matrix: ${ARCHS}"
+
+  build-apps:
+    name: Build Packages (${{ matrix.arch.name }})
+    needs: list-archs
+    if: needs.list-archs.outputs.archs != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    concurrency:
+      group: publish-apps-${{ matrix.arch.channel }}-${{ matrix.arch.name }}
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(needs.list-archs.outputs.archs) }}
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 安装构建与解析依赖
+        uses: ./.github/actions/setup-build-env
+        with:
+          profile: full
+
+      - name: 配置 ccache
+        run: |
+          echo "CCACHE_DIR=${HOME}/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=1G"          >> "$GITHUB_ENV"
+
+      - name: 挂载并恢复 ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-pkg-${{ matrix.arch.name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-pkg-${{ matrix.arch.name }}-
+
+      - name: 下载并配置 SDK
+        uses: ./.github/actions/setup-openwrt-archive
+        with:
+          archive_type: sdk
+          channel: ${{ matrix.arch.channel }}
+          downloads: ${{ matrix.arch.upstream }}
+          mode: ${{ matrix.arch.mode }}
+          target: ${{ matrix.arch.sdk_target }}
+          out_dir: sdk
+          r2_public_url: ${{ vars.R2_PUBLIC_URL }}
+
+      - name: 准备签名密钥
+        id: keys
+        uses: ./.github/actions/setup-apk-keys
+        with:
+          private_key: ${{ secrets.APK_PRIVATE_KEY }}
+          public_key: ${{ secrets.APK_PUBLIC_KEY }}
+
+      - name: 注入自有 feed
+        uses: ./.github/actions/inject-custom-feeds
+        with:
+          sdk_dir: sdk
+
+      - name: Makefile 静态校验
+        run: |
+          if [[ -f scripts/lint-packages.sh ]]; then
+            bash scripts/lint-packages.sh
+          fi
+
+      - name: 初始化构建配置
+        working-directory: sdk
+        run: |
+          [[ -n "${{ steps.keys.outputs.private_key_path }}" && -f "${{ steps.keys.outputs.private_key_path }}" ]] && cp "${{ steps.keys.outputs.private_key_path }}" private-key.pem || true
+          cp "${{ steps.keys.outputs.public_key_path }}" public-key.pem
+          export CCACHE_DIR="${HOME}/.ccache"
+          make defconfig
+          # 强制开启索引签名配置，避免设备端安装软件时因缺少签名报 UNTRUSTED
+          if ! grep -q '^CONFIG_SIGNED_PACKAGES=y' .config; then
+            echo 'CONFIG_SIGNED_PACKAGES=y' >> .config
+            make defconfig
+          fi
+          grep -E '^CONFIG_(SIGNED_PACKAGES|USE_APK)=' .config || echo "::warning::未找到 SIGNED_PACKAGES/USE_APK 配置项"
+
+      - name: 编译本 feed 的包
+        working-directory: sdk
+        run: |
+          export CCACHE_DIR="${HOME}/.ccache"
+          PKGS="$(find "${GITHUB_WORKSPACE}/packages/" -mindepth 2 -maxdepth 2 -name Makefile -exec dirname {} \; | xargs -n1 basename | sort -u || true)"
+          if [[ -z "${PKGS}" ]]; then
+            echo "当前 feed 未包含自定义软件包，跳过编译。"
+            exit 0
+          fi
+
+          for pkg in ${PKGS}; do
+            echo "::group::编译 ${pkg}"
+            if ! make "package/${pkg}/compile" -j"$(nproc)" -k; then
+              echo "::warning::软件包 ${pkg} 并发构建失败，切换单线程重试..."
+              make "package/${pkg}/compile" V=s -j1
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: 生成包索引
+        working-directory: sdk
+        run: make package/index V=s
+
+      - name: 收集产物
+        run: |
+          ARCH="${{ matrix.arch.name }}"
+          OUT="out/apps/${ARCH}"
+          mkdir -p "${OUT}"
+          find "sdk/bin/packages/${ARCH}/custom_feed" -name '*.apk' \
+            -exec cp {} "${OUT}/" \; 2>/dev/null || true
+          cp "sdk/bin/packages/${ARCH}/custom_feed/packages.adb" "${OUT}/" 2>/dev/null || true
+          echo "收集产物统计: $(find "${OUT}" -name '*.apk' 2>/dev/null | wc -l) apk, packages.adb"
+
+      - name: 校验与 emit manifest
+        uses: ./.github/actions/emit-manifest
+        with:
+          dir: out/apps/${{ matrix.arch.name }}
+          arch: ${{ matrix.arch.name }}
+          artifact_type: apps
+          channel: ${{ matrix.arch.channel }}
+          apk_public_key: ${{ secrets.APK_PUBLIC_KEY }}
+
+      - name: 发布到 R2
+        uses: ./.github/actions/publish-r2
+        with:
+          src: out/apps/${{ matrix.arch.name }}
+          dst: ${{ matrix.arch.channel }}/packages/${{ matrix.arch.name }}
+          mode: sync
+          bucket: ${{ vars.R2_BUCKET }}
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 生成 Action 总结报告与安全清理
+        if: always()
+        run: |
+          rm -f sdk/private-key.pem
+          OUT="out/apps/${{ matrix.arch.name }}"
+          source scripts/lib/common.sh
+          emit_summary_table "自定义软件包构建报告" \
+            "目标架构" "\`${{ matrix.arch.name }}\`" \
+            "发布通道" "\`${{ matrix.arch.channel }}\`" \
+            "产物数量" "$(find "${OUT}" -name '*.apk' 2>/dev/null | wc -l) 个 APK 软件包" \
+            "包索引文件" "$([[ -f "${OUT}/packages.adb" ]] && echo "已生成 (packages.adb)" || echo "未生成")" \
+            "分发状态" "已同步至 Cloudflare R2"

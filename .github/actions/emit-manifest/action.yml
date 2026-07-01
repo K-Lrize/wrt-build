@@ -1,0 +1,99 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+
+name: Emit build manifest
+description: 校验 packages.adb 已存在 + 写 manifest.json
+
+inputs:
+  dir:
+    description: 含 packages.adb 与 .apk 的目录
+    required: true
+  arch:
+    required: false
+    default: ""
+  target:
+    description: target/subtarget
+    required: false
+    default: ""
+  artifact_type:
+    description: apps | kmods | firmware | sdk-ib
+    required: true
+  channel:
+    description: source.channel（R2 命名空间）
+    required: false
+    default: ""
+  apk_public_key:
+    required: true
+  vermagic_segment:
+    description: kmod 或内核驱动的 vermagic_segment 标识
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: 计算公钥指纹
+      shell: bash
+      env:
+        APK_PUB: ${{ inputs.apk_public_key }}
+      run: |
+        FINGERPRINT="$(printf '%s\n' "${APK_PUB}" \
+          | bash "${GITHUB_WORKSPACE}/scripts/apk-fingerprint.sh")"
+        echo "KEY_FINGERPRINT=${FINGERPRINT}" >> "${GITHUB_ENV}"
+
+    - name: 校验 packages.adb
+      shell: bash
+      run: |
+        DIR="${GITHUB_WORKSPACE}/${{ inputs.dir }}"
+        [[ -d "${DIR}" ]]               || { echo "::error::目标产物目录不存在: ${DIR}"; exit 1; }
+        [[ -f "${DIR}/packages.adb" ]]  || { echo "::error::未找到 packages.adb 索引文件 (make package/index 执行异常)"; exit 1; }
+        ls -la "${DIR}/packages.adb"
+
+    - name: 写 manifest.json
+      shell: bash
+      run: |
+        DIR="${GITHUB_WORKSPACE}/${{ inputs.dir }}"
+        TEMP_JSONL="${RUNNER_TEMP:-/tmp}/items_${GITHUB_RUN_ID:-run}_$$.jsonl"
+        rm -f "${TEMP_JSONL}"
+        touch "${TEMP_JSONL}"
+        while IFS= read -r apk_file; do
+          fn="$(basename "${apk_file}" .apk)"
+          name="$(echo "${fn}" | sed 's/-[0-9].*//')"
+          ver="$(echo "${fn}" | grep -oE '(?<=-)[0-9.]+(_[a-z0-9]+)?(-r[0-9]+)?' | head -1 || echo "")"
+          size="$(stat -c%s "${apk_file}")"
+          sha256="$(sha256sum "${apk_file}" | cut -d' ' -f1)"
+          jq -n -c --arg n "${name}" --arg v "${ver}" --argjson s "${size}" --arg h "${sha256}" \
+            '{name: $n, version: $v, size: $s, sha256: $h}' >> "${TEMP_JSONL}"
+        done < <(find "${DIR}" -maxdepth 1 -name '*.apk')
+
+        FEED_COMMIT="$(git -C "${GITHUB_WORKSPACE}" rev-parse --short HEAD 2>/dev/null || echo n/a)"
+
+        jq -n \
+          --arg channel "${{ inputs.channel }}" \
+          --arg commit "${GITHUB_SHA:0:7}" \
+          --arg feed_commit "${FEED_COMMIT}" \
+          --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg arch "${{ inputs.arch }}" \
+          --arg target "${{ inputs.target }}" \
+          --arg fingerprint "${KEY_FINGERPRINT}" \
+          --arg run_id "${GITHUB_RUN_ID}" \
+          --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+          --arg type "${{ inputs.artifact_type }}" \
+          --arg vermagic "${{ inputs.vermagic_segment }}" \
+          --slurpfile items "${TEMP_JSONL}" \
+          '{
+            channel: $channel,
+            build_commit: $commit,
+            feed_commit: $feed_commit,
+            build_time: $time,
+            arch: $arch,
+            target: $target,
+            key_fingerprint: $fingerprint,
+            ci_run_id: $run_id,
+            ci_run_url: $run_url,
+            type: $type,
+            vermagic_segment: $vermagic,
+            items: $items
+          }' > "${DIR}/manifest.json"
+
+        rm -f "${TEMP_JSONL}"
+        echo "items: $(jq '.items | length' "${DIR}/manifest.json")"
