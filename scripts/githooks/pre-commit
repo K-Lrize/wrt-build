@@ -15,4 +15,7 @@ bash scripts/fmt.sh
 # 自动将排版整理后的变更更新至暂存区
 git add -u
 
+echo "[INFO] 触发 Pre-commit 钩子：执行静态语法校验..."
+bash scripts/lint-packages.sh
+
 echo "[ OK ] Pre-commit 校验通过，允许提交。"

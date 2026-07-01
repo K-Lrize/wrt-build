@@ -27,3 +27,6 @@ jobs:
 
       - name: 校验 Shell 脚本排版格式
         run: find scripts -name "*.sh" -exec shfmt -d -i 4 -s {} +
+
+      - name: 静态校验软件包 Makefile
+        run: bash scripts/lint-packages.sh
