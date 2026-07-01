@@ -1,0 +1,335 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Build toolchain
+
+on:
+  push:
+    paths:
+      - "devices/**"
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      skip_firmware:
+        description: "跳过固件组装"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  list-custom-targets:
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 安装解析依赖
+        uses: ./.github/actions/setup-build-env
+        with:
+          profile: minimal
+
+      - name: 解析构建目标矩阵
+        id: list
+        # 相同目标架构与源码分支的设备复用同一次全量编译构建
+        run: |
+          TARGETS="$(
+            for dy in devices/*/device.yaml; do
+              [[ -f "${dy}" ]] || continue
+              MODE="$(yq '.source.mode // ""' "${dy}")"
+              [[ "${MODE}" == "build" ]] || continue
+              REPO="$(yq '.source.repo // ""' "${dy}")"
+              REF="$(yq '.source.ref // ""' "${dy}")"
+              [[ -n "${REPO}" && -n "${REF}" ]] || continue
+              CHANNEL="$(yq '.source.channel' "${dy}")"
+              T="$(yq '.target' "${dy}")"
+              S="$(yq '.subtarget' "${dy}")"
+              jq -n --arg n "${CHANNEL}|${T}-${S}" \
+                    --arg channel "${CHANNEL}" \
+                    --arg t "${T}" --arg s "${S}" --arg ts "${T}-${S}" \
+                    --arg repo "${REPO}" --arg ref "${REF}" \
+                '{"name":$n,"channel":$channel,"target":$t,"sub":$s,"target_sub":$ts,"repo":$repo,"ref":$ref}'
+            done | jq -sc 'unique_by(.name)'
+          )"
+          echo "targets=${TARGETS}" >> "$GITHUB_OUTPUT"
+          echo "matrix: ${TARGETS}"
+
+      - name: 生成 Action 总结报告
+        if: steps.list.outputs.targets == '[]' || steps.list.outputs.targets == ''
+        run: |
+          {
+            echo "### 工具链构建报告 (Skipped)"
+            echo ""
+            echo "当前设备均使用 \`mode: download\`（拉取官方 ImageBuilder 与 SDK），无针对自定义内核与工具链的源码编译（\`mode: build\`）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-fullimage:
+    name: Build Toolchain (${{ matrix.target.name }})
+    needs: list-custom-targets
+    if: needs.list-custom-targets.outputs.targets != '[]'
+    runs-on: ubuntu-24.04
+
+    concurrency:
+      group: publish-fullimage-${{ matrix.target.name }}
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.list-custom-targets.outputs.targets) }}
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 安装构建与解析依赖
+        uses: ./.github/actions/setup-build-env
+        with:
+          profile: full
+
+      - name: 配置 ccache
+        run: |
+          echo "CCACHE_DIR=${HOME}/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=3G"          >> "$GITHUB_ENV"
+
+      - name: 恢复 ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.target.name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.target.name }}-
+
+      - name: 克隆 OpenWrt 源码
+        run: |
+          git clone --branch "${{ matrix.target.ref }}" --depth 1 \
+            "${{ matrix.target.repo }}" openwrt
+
+      - name: 准备签名密钥
+        id: keys
+        uses: ./.github/actions/setup-apk-keys
+        with:
+          private_key: ${{ secrets.APK_PRIVATE_KEY }}
+          public_key: ${{ secrets.APK_PUBLIC_KEY }}
+
+      - name: 注入自有 feed
+        uses: ./.github/actions/inject-custom-feeds
+        with:
+          sdk_dir: openwrt
+
+      - name: 初始化构建配置并开启 ccache
+        run: |
+          [[ -n "${{ steps.keys.outputs.private_key_path }}" && -f "${{ steps.keys.outputs.private_key_path }}" ]] && cp "${{ steps.keys.outputs.private_key_path }}" openwrt/private-key.pem || true
+          cp "${{ steps.keys.outputs.public_key_path }}" openwrt/public-key.pem
+          cd openwrt
+          {
+            echo "CONFIG_TARGET_${{ matrix.target.target }}=y"
+            echo "CONFIG_TARGET_${{ matrix.target.target }}_${{ matrix.target.sub }}=y"
+            echo "CONFIG_ALL_KMODS=y"
+            # 强制产出全部 toolchain 运行时库,避免官方 L3 依赖 libatomic1/libstdcpp6/libssp 时缺件
+            echo "CONFIG_INSTALL_LIBSTDCPP=y"
+            echo "CONFIG_INSTALL_LIBSSP=y"
+            echo "CONFIG_PACKAGE_libatomic=m"
+            echo "CONFIG_PACKAGE_libstdcpp=m"
+            echo "CONFIG_PACKAGE_libssp=m"
+            echo "CONFIG_SDK=y"
+            echo "CONFIG_IB=y"
+            echo "# CONFIG_IB_STANDALONE is not set"
+            echo "CONFIG_CCACHE=y"
+          } >> .config
+          make defconfig
+
+      - name: 全量编译
+        working-directory: openwrt
+        run: make -j"$(nproc)" IGNORE_ERRORS=1 world
+
+      - name: 收集 SDK / IB
+        run: |
+          T="${{ matrix.target.target }}"; S="${{ matrix.target.sub }}"
+          OUT="out/sdk-ib/${T}/${S}"
+          mkdir -p "${OUT}"
+          cp openwrt/bin/targets/"${T}"/"${S}"/openwrt-sdk-*.tar.* "${OUT}/" 2>/dev/null || true
+          cp openwrt/bin/targets/"${T}"/"${S}"/openwrt-imagebuilder-*.tar.* "${OUT}/" 2>/dev/null || true
+          (cd "${OUT}" && sha256sum openwrt-*.tar.* > sha256sums 2>/dev/null || true)
+
+      - name: 发布 SDK / IB
+        uses: ./.github/actions/publish-r2
+        with:
+          src: out/sdk-ib/${{ matrix.target.target }}/${{ matrix.target.sub }}
+          dst: ${{ matrix.target.channel }}/targets/${{ matrix.target.target }}/${{ matrix.target.sub }}/sdk-ib
+          mode: sync
+          bucket: ${{ vars.R2_BUCKET }}
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 收集 kmod 与 base 全集并识别 vermagic
+        id: kmod_meta
+        run: |
+          T="${{ matrix.target.target }}"; S="${{ matrix.target.sub }}"
+          PKG_DIR="openwrt/bin/targets/${T}/${S}/packages"
+          [[ -d "${PKG_DIR}" ]] || { echo "::error::未找到目标包输出目录: ${PKG_DIR}"; exit 1; }
+
+          # 识别完整 vermagic (<linux 版本>-1-<hash>)
+          KMOD_REAL_DIR="$(ls -d openwrt/bin/targets/${T}/${S}/kmods/* 2>/dev/null | head -1 || true)"
+          if [[ -n "${KMOD_REAL_DIR}" && -d "${KMOD_REAL_DIR}" ]]; then
+            VM_SEG="$(basename "${KMOD_REAL_DIR}")"
+          else
+            VM_FILE="$(ls openwrt/build_dir/target-*/linux-${T}_${S}/linux-*/.vermagic 2>/dev/null | head -1)"
+            [[ -f "${VM_FILE}" ]] || { echo "::error::未找到 .vermagic"; exit 1; }
+            VM_HASH="$(tr -d '\r\n' < "${VM_FILE}")"
+            LINUX_DIR="$(ls -d openwrt/build_dir/target-*/linux-${T}_${S}/linux-* 2>/dev/null | head -1)"
+            LINUX_VER="$(basename "${LINUX_DIR}" | sed 's/^linux-//')"
+            VM_SEG="${LINUX_VER}-1-${VM_HASH}"
+          fi
+          echo "vm_seg=${VM_SEG}" >> "$GITHUB_OUTPUT"
+          echo "完整标准内核 vermagic 标识: ${VM_SEG}"
+
+          TOP="$(pwd)/openwrt"
+          APK_BIN="${TOP}/staging_dir/host/bin/apk"
+          APK_KEY="${TOP}/private-key.pem"
+          [[ -x "${APK_BIN}" ]] || { echo "::error::未找到 apk 工具: ${APK_BIN}"; exit 1; }
+          [[ -f "${APK_KEY}" ]] || { echo "::error::未找到 APK 签名私钥: ${APK_KEY}"; exit 1; }
+
+          # 仅对目录内实际存在的 apk 重建并签名索引
+          regen_index() {
+            local dir="$1"
+            ( cd "${dir}" \
+              && ls *.apk >/dev/null 2>&1 \
+              && "${APK_BIN}" mkndx --root "${TOP}" --keys-dir "${TOP}" --allow-untrusted \
+                   --sign "${APK_KEY}" --output packages.adb *.apk )
+          }
+
+          # 拆分为 kmod 与 base(+kernel) 两列
+          KMOD_OUT="out/kmods/${VM_SEG}"
+          BASE_OUT="out/base/${T}/${S}"
+          mkdir -p "${KMOD_OUT}" "${BASE_OUT}"
+          shopt -s nullglob
+
+          for src in "${PKG_DIR}" "openwrt/bin/targets/${T}/${S}/kmods/${VM_SEG}"; do
+            [[ -d "${src}" ]] || continue
+            for f in "${src}"/kmod-*.apk; do [[ -e "${f}" ]] && cp "${f}" "${KMOD_OUT}/"; done
+          done
+
+          for f in "${PKG_DIR}"/*.apk; do
+            [[ -e "${f}" ]] || continue
+            case "$(basename "${f}")" in
+              kmod-*) : ;;
+              *) cp "${f}" "${BASE_OUT}/" ;;
+            esac
+          done
+          shopt -u nullglob
+
+          regen_index "${KMOD_OUT}" || { echo "::error::kmod 索引生成失败"; exit 1; }
+          regen_index "${BASE_OUT}" || { echo "::error::base 索引生成失败"; exit 1; }
+          echo "kmod 包数量: $(find "${KMOD_OUT}" -name 'kmod-*.apk' | wc -l)；base 包数量: $(find "${BASE_OUT}" -maxdepth 1 -name '*.apk' | wc -l)"
+
+          # 生成 latest-toolchain.json 指针
+          SDK_PATH="$(ls out/sdk-ib/${T}/${S}/openwrt-sdk-*.tar.* 2>/dev/null | head -1 || true)"
+          IB_PATH="$(ls out/sdk-ib/${T}/${S}/openwrt-imagebuilder-*.tar.* 2>/dev/null | head -1 || true)"
+          SDK_FILE=""
+          IB_FILE=""
+          [[ -n "${SDK_PATH}" && -f "${SDK_PATH}" ]] && SDK_FILE="$(basename "${SDK_PATH}")"
+          [[ -n "${IB_PATH}" && -f "${IB_PATH}" ]] && IB_FILE="$(basename "${IB_PATH}")"
+          mkdir -p out/registry
+          jq -n --arg vm "${VM_SEG}" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg sdk "${SDK_FILE}" --arg ib "${IB_FILE}" \
+            '{vermagic_segment: $vm, updated_time: $time, sdk_archive: $sdk, imagebuilder_archive: $ib}' > out/registry/latest-toolchain.json
+
+      - name: 校验与 emit manifest（kmod）
+        uses: ./.github/actions/emit-manifest
+        with:
+          dir: out/kmods/${{ steps.kmod_meta.outputs.vm_seg }}
+          target: ${{ matrix.target.target }}/${{ matrix.target.sub }}
+          artifact_type: kmods
+          channel: ${{ matrix.target.channel }}
+          apk_public_key: ${{ secrets.APK_PUBLIC_KEY }}
+          vermagic_segment: ${{ steps.kmod_meta.outputs.vm_seg }}
+
+      - name: 发布 kmod
+        uses: ./.github/actions/publish-r2
+        with:
+          src: out/kmods/${{ steps.kmod_meta.outputs.vm_seg }}
+          dst: ${{ matrix.target.channel }}/targets/${{ matrix.target.target }}/${{ matrix.target.sub }}/kmods/${{ steps.kmod_meta.outputs.vm_seg }}
+          mode: sync
+          bucket: ${{ vars.R2_BUCKET }}
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 校验与 emit manifest（base）
+        uses: ./.github/actions/emit-manifest
+        with:
+          dir: out/base/${{ matrix.target.target }}/${{ matrix.target.sub }}
+          target: ${{ matrix.target.target }}/${{ matrix.target.sub }}
+          artifact_type: base
+          channel: ${{ matrix.target.channel }}
+          apk_public_key: ${{ secrets.APK_PUBLIC_KEY }}
+          vermagic_segment: ${{ steps.kmod_meta.outputs.vm_seg }}
+
+      - name: 发布 base (target 核心包 libc/libgcc/fstools/... + kernel)
+        uses: ./.github/actions/publish-r2
+        with:
+          src: out/base/${{ matrix.target.target }}/${{ matrix.target.sub }}
+          dst: ${{ matrix.target.channel }}/targets/${{ matrix.target.target }}/${{ matrix.target.sub }}/packages
+          mode: sync
+          bucket: ${{ vars.R2_BUCKET }}
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 发布最新工具链指针 (latest-toolchain.json)
+        uses: ./.github/actions/publish-r2
+        with:
+          src: out/registry
+          dst: ${{ matrix.target.channel }}/targets/${{ matrix.target.target }}/${{ matrix.target.sub }}
+          mode: copy
+          bucket: ${{ vars.R2_BUCKET }}
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 生成 Action 总结报告与安全清理
+        if: always()
+        run: |
+          rm -f openwrt/private-key.pem
+          source scripts/lib/common.sh
+          emit_summary_table "SDK 与内核工具链编译报告" \
+            "目标架构" "\`${{ matrix.target.target }}/${{ matrix.target.sub }}\`" \
+            "发布通道" "\`${{ matrix.target.channel }}\`" \
+            "内核标识 (vermagic)" "\`${{ steps.kmod_meta.outputs.vm_seg }}\`" \
+            "编译 kmod 数量" "$(find out/kmods -name 'kmod-*.apk' 2>/dev/null | wc -l) 个 APK" \
+            "分发状态" "已同步至 Cloudflare R2"
+
+      - name: 收集本架构 mode:build 设备列表
+        id: device_list
+        run: |
+          T="${{ matrix.target.target }}"
+          S="${{ matrix.target.sub }}"
+          DEVICES="$(for dy in devices/*/device.yaml; do
+            [[ -f "${dy}" ]] || continue
+            [[ "$(yq '.source.mode // ""' "${dy}")" == "build" ]] || continue
+            [[ "$(yq '.target' "${dy}")" == "${T}" ]] || continue
+            [[ "$(yq '.subtarget' "${dy}")" == "${S}" ]] || continue
+            basename "$(dirname "${dy}")"
+          done | paste -sd ',')"
+          echo "devices=${DEVICES}" >> "$GITHUB_OUTPUT"
+
+      - name: 触发 build-firmware
+        if: inputs.skip_firmware != true && steps.device_list.outputs.devices != ''
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build-firmware.yml',
+              ref: context.ref,
+              inputs: { device: '${{ steps.device_list.outputs.devices }}' }
+            })
