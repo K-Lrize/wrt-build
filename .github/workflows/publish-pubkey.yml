@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Publish APK public key
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 准备公钥与指纹
+        id: keys
+        uses: ./.github/actions/setup-apk-keys
+        with:
+          public_key: ${{ secrets.APK_PUBLIC_KEY }}
+
+      - name: 输出到待发布目录
+        run: |
+          mkdir -p out
+          cp "${{ steps.keys.outputs.public_key_path }}" out/public-key.pem
+          echo "${{ steps.keys.outputs.fingerprint }}" > out/public-key.fingerprint
+
+      - name: 推送到 R2 桶根
+        uses: ./.github/actions/publish-r2
+        with:
+          src: out
+          dst: ""
+          mode: copy
+          bucket: ${{ vars.R2_BUCKET }}
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
