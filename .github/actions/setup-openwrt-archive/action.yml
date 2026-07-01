@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+
+name: Setup OpenWrt Archive
+description: 下载并解压 OpenWrt 远程或 R2 上的归档包 (SDK 或 ImageBuilder)
+
+inputs:
+  archive_type:
+    description: "归档类型名称前缀，例如: sdk 或 imagebuilder"
+    required: true
+  channel:
+    description: "source.channel / OpenWrt 版本通道（例如: openwrt-25.12 或 snapshot）"
+    required: true
+  mode:
+    description: "来源模式：download (官方/第三方下载源) 或 build (R2 自编译库)"
+    required: false
+    default: "download"
+  target:
+    description: "target/subtarget 芯片架构路径（例: mediatek/filogic）"
+    required: true
+  downloads:
+    description: "官方或第三方源下载基准 URL (mode=download 时必填)"
+    required: false
+    default: ""
+  r2_public_url:
+    description: "R2 存储桶公网访问根 URL (mode=build 时必填)"
+    required: false
+    default: ""
+  out_dir:
+    description: "解压目标目录"
+    required: false
+    default: "archive"
+
+runs:
+  using: composite
+  steps:
+    - name: 下载并解压 OpenWrt 归档包
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.mode }}" == "build" ]]; then
+          [[ -n "${{ inputs.r2_public_url }}" ]] || { echo "::error::当 mode=build 时，参数 r2_public_url 为必填项"; exit 1; }
+          BASE_URL="${{ inputs.r2_public_url }}/${{ inputs.channel }}/targets/${{ inputs.target }}/sdk-ib"
+          echo "正在从 R2 存储桶查询归档包元数据..."
+          META_URL="${{ inputs.r2_public_url }}/${{ inputs.channel }}/targets/${{ inputs.target }}/latest-toolchain.json"
+          FILENAME="$(curl -fsSL --connect-timeout 15 "${META_URL}" 2>/dev/null | jq -r ".${{ inputs.archive_type }}_archive // empty" 2>/dev/null || true)"
+          if [[ -z "${FILENAME}" || "${FILENAME}" == "null" ]]; then
+            echo "::error::未在 R2 找到归档包元数据文件 (${META_URL}) 或字段 .${{ inputs.archive_type }}_archive 为空。请确保已正确触发该分支的 build-toolchain 流水线！"
+            exit 1
+          fi
+        else
+          [[ -n "${{ inputs.downloads }}" ]] || { echo "::error::当 mode=download 时，参数 downloads 为必填项"; exit 1; }
+          BASE_URL="${{ inputs.downloads }}/targets/${{ inputs.target }}"
+          echo "正在查询远程仓库归档文件名: ${BASE_URL}/"
+          FILENAME="$(curl -fsSL --connect-timeout 15 "${BASE_URL}/sha256sums" 2>/dev/null | grep -oE "openwrt-${{ inputs.archive_type }}-[^\"'\s]+\.tar\.(zst|xz|gz)" | head -1 || true)"
+          if [[ -z "${FILENAME}" ]]; then
+            FILENAME="$(curl -fsSL --connect-timeout 15 "${BASE_URL}/" 2>/dev/null | grep -oE "openwrt-${{ inputs.archive_type }}-[^\"']+\.tar\.(zst|xz|gz)" | head -1 || true)"
+          fi
+          [[ -n "${FILENAME}" ]] || { echo "::error::在远程源未找到类型为 ${{ inputs.archive_type }} 的归档包: ${BASE_URL}"; exit 1; }
+        fi
+
+        echo "开始下载: ${BASE_URL}/${FILENAME}"
+        curl -fL --retry 3 --connect-timeout 30 --max-time 600 "${BASE_URL}/${FILENAME}" -o archive_temp
+        mkdir -p "${{ inputs.out_dir }}"
+        tar -xf archive_temp --strip-components=1 -C "${{ inputs.out_dir }}"
+        rm -f archive_temp
+
+    - name: 完整性基本校验
+      shell: bash
+      run: |
+        set -euo pipefail
+        OUT="${{ inputs.out_dir }}"
+        [[ -d "${OUT}" && -n "$(ls -A "${OUT}")" ]] || { echo "::error::归档解压后目录为空: ${OUT}"; exit 1; }
+        echo "OpenWrt ${{ inputs.archive_type }} 准备就绪 [target=${{ inputs.target }}, mode=${{ inputs.mode }}]"

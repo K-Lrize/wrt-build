@@ -1,0 +1,65 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+
+name: Setup APK Signing Keys
+description: 安全准备 OpenWrt APK 签名公私钥并提取指纹
+
+inputs:
+  private_key:
+    description: "APK 签名私钥 PEM (可选)"
+    required: false
+    default: ""
+  public_key:
+    description: "APK 签名公钥 PEM (可选，若为空则从私钥自动推导)"
+    required: false
+    default: ""
+  out_dir:
+    description: "安全输出目录 (建议存放在 RUNNER_TEMP)"
+    required: false
+    default: "${{ runner.temp }}/secure-apk-keys"
+
+outputs:
+  private_key_path:
+    description: "私钥文件安全绝对路径"
+    value: ${{ steps.keys.outputs.priv }}
+  public_key_path:
+    description: "公钥文件绝对路径"
+    value: ${{ steps.keys.outputs.pub }}
+  fingerprint:
+    description: "公钥指纹 (SHA256)"
+    value: ${{ steps.keys.outputs.fp }}
+
+runs:
+  using: composite
+  steps:
+    - id: keys
+      name: 准备公私钥与指纹
+      shell: bash
+      run: |
+        set -euo pipefail
+        OUT="${{ inputs.out_dir }}"
+        mkdir -p "${OUT}"
+        chmod 700 "${OUT}"
+
+        PRIV_INPUT="${{ inputs.private_key }}"
+        PUB_INPUT="${{ inputs.public_key }}"
+
+        PRIV_PATH=""
+        if [[ -n "${PRIV_INPUT}" ]]; then
+          PRIV_PATH="${OUT}/private.pem"
+          printf '%s\n' "${PRIV_INPUT}" > "${PRIV_PATH}"
+          chmod 600 "${PRIV_PATH}"
+          echo "priv=${PRIV_PATH}" >> "$GITHUB_OUTPUT"
+        fi
+
+        if [[ -z "${PUB_INPUT}" ]]; then
+          echo "::error::未提供 public_key 参数（请检查 GitHub Secrets 或 Workflow 参数设置）！"
+          exit 1
+        fi
+
+        FP="$(printf '%s\n' "${PUB_INPUT}" | bash "${GITHUB_WORKSPACE}/scripts/apk-fingerprint.sh")"
+        PUB_PATH="${OUT}/${FP}.pem"
+        printf '%s\n' "${PUB_INPUT}" > "${PUB_PATH}"
+        chmod 644 "${PUB_PATH}"
+
+        echo "pub=${PUB_PATH}" >> "$GITHUB_OUTPUT"
+        echo "fp=${FP}" >> "$GITHUB_OUTPUT"
