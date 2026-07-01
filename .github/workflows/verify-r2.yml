@@ -1,0 +1,127 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Verify R2 repository
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 安装基础环境依赖
+        uses: ./.github/actions/setup-build-env
+        with:
+          profile: minimal
+
+      - name: 下载并解压 OpenWrt 宿主工具
+        uses: ./.github/actions/setup-openwrt-archive
+        with:
+          archive_type: sdk
+          channel: snapshot
+          mode: download
+          target: x86/64
+          downloads: https://downloads.openwrt.org/snapshots
+          out_dir: host-sdk
+
+      - name: 配置环境变量
+        run: echo "${GITHUB_WORKSPACE}/host-sdk/staging_dir/host/bin" >> $GITHUB_PATH
+
+      - name: 配置 rclone
+        uses: ./.github/actions/setup-rclone
+        with:
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 同步桶内容到本地
+        env:
+          BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          mkdir -p repo
+          rclone copy "r2:${BUCKET}" repo --progress --transfers 8
+
+      - name: 准备签名公钥
+        id: keys
+        uses: ./.github/actions/setup-apk-keys
+        with:
+          public_key: ${{ secrets.APK_PUBLIC_KEY }}
+
+      - name: 配置验签目录
+        run: |
+          mkdir -p repo-keys
+          cp "${{ steps.keys.outputs.public_key_path }}" "repo-keys/${{ steps.keys.outputs.fingerprint }}.pem"
+          cp "${{ steps.keys.outputs.public_key_path }}" pubkey.pem
+
+      - name: 验证 packages.adb 签名
+        run: |
+          errors=0
+          while IFS= read -r adb; do
+            echo "::group::verify ${adb}"
+            if apk verify -v --keys-dir "${PWD}/repo-keys" "${adb}" 2>&1; then
+              echo "OK: ${adb}"
+            else
+              echo "::error::签名验证失败：${adb}"
+              ((errors++)) || true
+            fi
+            echo "::endgroup::"
+          done < <(find repo -name "packages.adb")
+          echo "PKG_VERIFY_ERRORS=${errors}" >> "$GITHUB_ENV"
+
+      - name: 验证固件 sha256sums + 签名
+        if: success() || failure()
+        run: |
+          PUB="${PWD}/pubkey.pem"
+          errors=0
+          while IFS= read -r sumfile; do
+            dir="$(dirname "${sumfile}")"
+
+            if (cd "${dir}" && sha256sum -c sha256sums) 2>&1; then
+              echo "OK(sum): ${sumfile}"
+            else
+              echo "::error::sha256 校验失败：${sumfile}"
+              ((errors++)) || true
+            fi
+
+            sig="${dir}/sha256sums.sig"
+            if [[ -f "${sig}" ]]; then
+              if base64 -d "${sig}" > /tmp/ss.sig 2>/dev/null \
+                 && openssl dgst -sha256 -verify "${PUB}" \
+                      -signature /tmp/ss.sig "${sumfile}" >/dev/null 2>&1; then
+                echo "OK(sig): ${sig}"
+              else
+                echo "::error::sha256sums.sig 签名验证失败：${dir}"
+                ((errors++)) || true
+              fi
+            else
+              echo "::warning::缺少 sha256sums.sig：${dir}"
+            fi
+          done < <(find repo -path '*/firmware/*' -name "sha256sums")
+          echo "FW_VERIFY_ERRORS=${errors}" >> "$GITHUB_ENV"
+
+      - name: 生成 Action 总结报告
+        if: always()
+        run: |
+          TOTAL_ERRORS=$(( ${PKG_VERIFY_ERRORS:-0} + ${FW_VERIFY_ERRORS:-0} ))
+          VERIFY_STATUS="$( (( TOTAL_ERRORS == 0 )) && echo "✅ 全部验证通过" || echo "❌ ${TOTAL_ERRORS} 项校验失败" )"
+          source scripts/lib/common.sh
+          emit_summary_table "存储仓库巡检与签名验证报告" \
+            "巡检软件包索引数" "$(find repo -name 'packages.adb' 2>/dev/null | wc -l) 个索引文件" \
+            "巡检固件目录数" "$(find repo -path '*/firmware/*' -name 'sha256sums' 2>/dev/null | wc -l) 个固件快照" \
+            "签名校验状态" "${VERIFY_STATUS}"
+
+      - name: 校验最终结论判定
+        if: always()
+        run: |
+          TOTAL_ERRORS=$(( ${PKG_VERIFY_ERRORS:-0} + ${FW_VERIFY_ERRORS:-0} ))
+          (( TOTAL_ERRORS == 0 )) || { echo "::error::共检测到 ${TOTAL_ERRORS} 项签名验证或完整性失败"; exit 1; }
+
+      - name: 清理 rclone 临时凭证
+        if: always()
+        run: rm -f ~/.config/rclone/rclone.conf

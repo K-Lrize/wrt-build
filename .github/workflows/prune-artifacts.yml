@@ -1,0 +1,196 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Prune R2 artifacts
+
+on:
+  workflow_run:
+    workflows:
+      - Build device firmware
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "仅打印待删除目录，不实际删除"
+        type: boolean
+        default: true
+
+env:
+  MAX_RETAINED_FIRMWARES: 3
+  MAX_RETAINED_KMODS: 2
+  GRACE_PERIOD_DAYS: 7
+
+jobs:
+  cleanup:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 安装基础环境依赖
+        uses: ./.github/actions/setup-build-env
+        with:
+          profile: minimal
+
+      - name: 配置 rclone
+        uses: ./.github/actions/setup-rclone
+        with:
+          account_id: ${{ secrets.R2_ACCOUNT_ID }}
+          access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: 清理旧 firmware 快照
+        env:
+          BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          DRY_RUN="${{ inputs.dry_run || 'false' }}"
+          KEEP="${{ env.MAX_RETAINED_FIRMWARES }}"
+
+          rclone lsf "r2:${BUCKET}" --dirs-only --recursive --max-depth 6 2>/dev/null \
+            | grep -E '/firmware/[^/]+/$' | sed 's|/$||' \
+            > /tmp/all_device_dirs.txt || true
+
+          : > /tmp/keep_snaps.txt
+          while IFS= read -r device_dir; do
+            [[ -z "${device_dir}" ]] && continue
+            mapfile -t raw_snaps < <(rclone lsf "r2:${BUCKET}/${device_dir}" --dirs-only 2>/dev/null | sed 's|/$||')
+            snaps_with_time=()
+            for s in "${raw_snaps[@]}"; do
+              btime="$(rclone cat "r2:${BUCKET}/${device_dir}/${s}/manifest.json" 2>/dev/null | jq -r '.build_time // ""' || true)"
+              [[ -z "${btime}" ]] && btime="1970-01-01_${s}"
+              snaps_with_time+=("${btime}|${s}")
+            done
+            mapfile -t snaps < <(printf "%s\n" "${snaps_with_time[@]}" | sort -r | cut -d'|' -f2)
+            total="${#snaps[@]}"
+            (( total > 0 )) || continue
+
+            echo "::group::${device_dir} ($total 份)"
+            for (( i=0; i<total; i++ )); do
+              snap="${snaps[$i]}"
+              if (( i < KEEP )); then
+                echo "保留：${device_dir}/${snap}"
+                echo "${device_dir}/${snap}" >> /tmp/keep_snaps.txt
+              else
+                echo "待删除：${device_dir}/${snap}"
+                if [[ "${DRY_RUN}" != "true" ]]; then
+                  rclone purge "r2:${BUCKET}/${device_dir}/${snap}" 2>&1 | tail -2 || true
+                fi
+              fi
+            done
+            echo "::endgroup::"
+          done < /tmp/all_device_dirs.txt
+
+      - name: 收集保留 firmware 与指针的 vermagic 集合
+        env:
+          BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          : > /tmp/keep_vm.txt
+          # 1. 收集活跃固件的 vermagic
+          while IFS= read -r snap_path; do
+            [[ -z "${snap_path}" ]] && continue
+            MF="$(rclone cat "r2:${BUCKET}/${snap_path}/manifest.json" 2>/dev/null || echo '{}')"
+            VM_SEG="$(echo "${MF}" | jq -r '.vermagic_segment // ""')"
+            [[ -n "${VM_SEG}" ]] && echo "${VM_SEG}" >> /tmp/keep_vm.txt
+          done < /tmp/keep_snaps.txt
+
+          # 2. 收集最新工具链指针的 vermagic
+          while IFS= read -r reg_path; do
+            [[ -z "${reg_path}" ]] && continue
+            REG="$(rclone cat "r2:${BUCKET}/${reg_path}" 2>/dev/null || echo '{}')"
+            VM_SEG="$(echo "${REG}" | jq -r '.vermagic_segment // ""')"
+            [[ -n "${VM_SEG}" ]] && echo "${VM_SEG}" >> /tmp/keep_vm.txt
+          done < <(rclone lsf "r2:${BUCKET}" --recursive --files-only 2>/dev/null | grep 'latest-toolchain\.json$' || true)
+
+          sort -u /tmp/keep_vm.txt -o /tmp/keep_vm.txt
+          echo "受保护内核 vermagic 列表 ($(wc -l < /tmp/keep_vm.txt) 个):"
+          cat /tmp/keep_vm.txt
+
+      - name: 清理孤立 kmod 目录 (Top-N + 宽限期双重保护)
+        env:
+          BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          DRY_RUN="${{ inputs.dry_run || 'false' }}"
+          MAX_KMODS="${{ env.MAX_RETAINED_KMODS || 2 }}"
+          GRACE_DAYS="${{ env.GRACE_PERIOD_DAYS || 7 }}"
+          NOW_SEC="$(date +%s)"
+
+          rclone lsf "r2:${BUCKET}" --dirs-only --recursive --max-depth 6 2>/dev/null \
+            | grep -E '/kmods/[^/]+/$' | sed 's|/$||' \
+            > /tmp/all_kmod_dirs.txt || true
+
+          # 提取父级架构路径进行 Top-N 保留
+          cut -d'/' -f1-4 /tmp/all_kmod_dirs.txt | sort -u > /tmp/kmod_parents.txt || true
+
+          : > /tmp/protected_kmods.txt
+          while IFS= read -r parent; do
+            [[ -z "${parent}" ]] && continue
+            mapfile -t raw_kms < <(grep "^${parent}/" /tmp/all_kmod_dirs.txt)
+            kms_with_time=()
+            for km in "${raw_kms[@]}"; do
+              btime="$(rclone cat "r2:${BUCKET}/${km}/manifest.json" 2>/dev/null | jq -r '.build_time // ""' || true)"
+              [[ -z "${btime}" ]] && btime="1970-01-01_${km}"
+              kms_with_time+=("${btime}|${km}")
+            done
+            mapfile -t km_snaps < <(
+              printf "%s\n" "${kms_with_time[@]}" | sort -r | cut -d'|' -f2
+            )
+            for (( i=0; i<${#km_snaps[@]}; i++ )); do
+              if (( i < MAX_KMODS )); then
+                echo "${km_snaps[$i]}" >> /tmp/protected_kmods.txt
+              fi
+            done
+          done < /tmp/kmod_parents.txt
+
+          while IFS= read -r km_dir; do
+            [[ -z "${km_dir}" ]] && continue
+            vmseg="$(basename "${km_dir}")"
+
+            # 1. 如果在活跃固件或最新指针名单中，保留
+            if grep -qxF "${vmseg}" /tmp/keep_vm.txt 2>/dev/null; then
+              echo "保留 [活跃引用/指针]: ${km_dir}"
+              continue
+            fi
+
+            # 2. 如果属于最近 Top-N 编译产物，保留
+            if grep -qxF "${km_dir}" /tmp/protected_kmods.txt 2>/dev/null; then
+              echo "保留 [按架构 Top-${MAX_KMODS}]: ${km_dir}"
+              continue
+            fi
+
+            # 3. 检查 7 天时间宽限期 (Grace Period)
+            MF="$(rclone cat "r2:${BUCKET}/${km_dir}/manifest.json" 2>/dev/null || echo '{}')"
+            BUILD_TIME="$(echo "${MF}" | jq -r '.build_time // ""')"
+            if [[ -n "${BUILD_TIME}" ]]; then
+              BUILD_SEC="$(date -d "${BUILD_TIME}" +%s 2>/dev/null || echo 0)"
+              DIFF_DAYS=$(( (NOW_SEC - BUILD_SEC) / 86400 ))
+              if (( DIFF_DAYS < GRACE_DAYS )); then
+                echo "保留 [构建宽限期 ${DIFF_DAYS}d < ${GRACE_DAYS}d]: ${km_dir}"
+                continue
+              fi
+            fi
+
+            echo "清理过期 kmod: ${km_dir}"
+            if [[ "${DRY_RUN}" != "true" ]]; then
+              rclone purge "r2:${BUCKET}/${km_dir}" 2>&1 | tail -2 || true
+            fi
+          done < /tmp/all_kmod_dirs.txt
+
+      - name: 生成 Action 总结报告
+        if: always()
+        run: |
+          source scripts/lib/common.sh
+          emit_summary_table "存储仓库产物清理报告" \
+            "执行模式" "$([[ "${{ inputs.dry_run || 'false' }}" == "true" ]] && echo "模拟运行 (Dry Run)" || echo "实际清理")" \
+            "固件保留上限" "每日最近 \`${{ env.MAX_RETAINED_FIRMWARES }}\` 份快照" \
+            "驱动保留上限" "每个架构最新 \`${{ env.MAX_RETAINED_KMODS }}\` 份内核版本" \
+            "时间宽限期" "最近 \`${{ env.GRACE_PERIOD_DAYS }}\` 天内构建的产物豁免删除" \
+            "受保护内核标识" "$(wc -l < /tmp/keep_vm.txt 2>/dev/null || echo 0) 个 vermagic"
+
+      - name: 清理 rclone 临时凭证
+        if: always()
+        run: rm -f ~/.config/rclone/rclone.conf
