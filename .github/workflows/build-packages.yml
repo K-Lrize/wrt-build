@@ -24,6 +24,9 @@ jobs:
         with:
           profile: minimal
 
+      - name: 静态校验设备配置
+        run: bash scripts/lint-devices.sh
+
       - name: 解析构建架构矩阵
         id: list
         run: |

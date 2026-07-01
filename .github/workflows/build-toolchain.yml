@@ -33,6 +33,9 @@ jobs:
         with:
           profile: minimal
 
+      - name: 静态校验设备配置
+        run: bash scripts/lint-devices.sh
+
       - name: 解析构建目标矩阵
         id: list
         # 相同目标架构与源码分支的设备复用同一次全量编译构建

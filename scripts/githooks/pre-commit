@@ -16,6 +16,7 @@ bash scripts/fmt.sh
 git add -u
 
 echo "[INFO] 触发 Pre-commit 钩子：执行静态语法校验..."
+bash scripts/lint-devices.sh
 bash scripts/lint-packages.sh
 
 echo "[ OK ] Pre-commit 校验通过，允许提交。"
